@@ -2,14 +2,8 @@
   "name": "inflated-puts-tracker",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
-  "main": "server.js",
+  "description": "Streamlit-based options scanner. Node not required.",
   "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5",
-    "yahoo-finance2": "^2.13.3"
+    "start": "echo This project uses Streamlit. Run: streamlit run app.py"
   }
 }
