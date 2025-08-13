@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Fat Put Finder (Yahoo)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:24px;background:#0b0d10;color:#e8eaed}
+    h1{font-size:22px;margin:0 0 16px}
+    h2{font-size:18px;margin:20px 0 8px;color:#b7c0cd}
+    .card{background:#151922;border:1px solid #232937;border-radius:14px;padding:16px;max-width:1150px;margin-bottom:18px}
+    label{display:block;margin:8px 0 4px;color:#b7c0cd}
+    input{padding:8px 10px;border-radius:10px;border:1px solid #2a3242;background:#0f131a;color:#e8eaed;width:160px}
+    input.wide{width:100%}
+    button{padding:10px 14px;border-radius:12px;border:0;background:#3c82f6;color:white;cursor:pointer}
+    button:disabled{opacity:.6;cursor:default}
+    .row{display:flex;gap:12px;flex-wrap:wrap}
+    .mt{margin-top:14px}
+    table{width:100%;border-collapse:collapse;margin-top:16px}
+    th,td{padding:8px;border-bottom:1px solid #232937;text-align:right}
+    th:first-child,td:first-child{text-align:left}
+    .pill{display:inline-block;padding:6px 10px;border-radius:999px;background:#232937;color:#e8eaed;text-decoration:none}
+    .small{font-size:12px;color:#b7c0cd}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+    @media(max-width:1100px){.grid{grid-template-columns:1fr}}
+    .bar{height:8px;background:#232937;border-radius:999px;overflow:hidden}
+    .bar>div{height:100%;width:0%;background:#3c82f6;transition:width .2s ease}
+    .statusline{display:flex;gap:10px;align-items:center}
+  </style>
+</head>
+<body>
+  <h1>Fat Put Finder — Yahoo (15-min delayed) + Live Progress</h1>
+
+  <div class="grid">
+    <!-- Regular -->
+    <div class="card">
+      <h2>Regular Market Scan</h2>
+      <div class="row"><div style="flex:1">
+        <label>Tickers (optional, comma-separated)</label>
+        <input id="tickersR" class="wide" placeholder="leave blank to scan universe.txt" />
+      </div></div>
+      <div class="row mt">
+        <div><label>min Bid/Theo</label><input id="minBidTheoR" type="number" step="0.01" value="1.15"></div>
+        <div><label>min Vol</label><input id="minVolR" type="number" step="1" value="0"></div>
+        <div><label>min OI</label><input id="minOIR" type="number" step="1" value="0"></div>
+        <div><label>max DTE</label><input id="maxDTER" type="number" step="1" value="150"></div>
+        <div><label>near (± % of spot)</label><input id="nearR" type="number" step="0.05" value="0.40"></div>
+        <div><label>expiries / ticker</label><input id="expR" type="number" step="1" value="3"></div>
+        <div><label>concurrency</label><input id="concurrencyR" type="number" step="1" value="6"></div>
+        <div><label>limit rows</label><input id="limitR" type="number" step="1" value="200"></div>
+      </div>
+      <div class="row mt statusline">
+        <button id="runBtnR">Start Scan</button>
+        <a id="csvLinkR" class="pill" href="#" download>Download CSV</a>
+        <div id="statusR" class="small"></div>
+      </div>
+      <div class="bar"><div id="barR"></div></div>
+      <table id="tblR"><thead></thead><tbody></tbody></table>
+    </div>
+
+    <!-- After-hours / Weekend -->
+    <div class="card">
+      <h2>After-hours / Weekend Scan (last trade & previous close + intrinsic)</h2>
+      <div class="row"><div style="flex:1">
+        <label>Tickers (optional, comma-separated)</label>
+        <input id="tickersA" class="wide" placeholder="leave blank to scan universe.txt" />
+      </div></div>
+      <div class="row mt">
+        <div><label>min Price/Theo</label><input id="minBidTheoA" type="number" step="0.01" value="0.90"></div>
+        <div><label>min Intrinsic ($)</label><input id="minIntrinsicA" type="number" step="0.05" value="0.50"></div>
+        <div><label>min Vol</label><input id="minVolA" type="number" step="1" value="0"></div>
+        <div><label>min OI</label><input id="minOIA" type="number" step="1" value="0"></div>
+        <div><label>max DTE</label><input id="maxDTEA" type="number" step="1" value="150"></div>
+        <div><label>near (± % of spot)</label><input id="nearA" type="number" step="0.05" value="0.60"></div>
+        <div><label>expiries / ticker</label><input id="expA" type="number" step="1" value="4"></div>
+        <div><label>concurrency</label><input id="concurrencyA" type="number" step="1" value="6"></div>
+        <div><label>limit rows</label><input id="limitA" type="number" step="1" value="400"></div>
+      </div>
+      <div class="row mt">
+        <label><input type="checkbox" id="intrinsicA" checked> Use intrinsic fallback when quotes are empty</label>
+        <label><input type="checkbox" id="intrinsicOnlyA"> Intrinsic-only pricing</label>
+      </div>
+      <div class="row mt statusline">
+        <button id="runBtnA">Run After-hours Scan</button>
+        <a id="csvLinkA" class="pill" href="#" download>Download CSV</a>
+        <div id="statusA" class="small"></div>
+      </div>
+      <div class="bar"><div id="barA"></div></div>
+      <table id="tblA"><thead></thead><tbody></tbody></table>
+    </div>
+  </div>
+
+<script>
+function renderTable(kind, rows){
+  const tblHead = document.querySelector('#tbl'+kind+' thead');
+  const tblBody = document.querySelector('#tbl'+kind+' tbody');
+  tblHead.innerHTML = ''; tblBody.innerHTML = '';
+  if (!rows.length) return;
+  const headers = Object.keys(rows[0]);
+  const tr = document.createElement('tr');
+  headers.forEach(h => { const th=document.createElement('th'); th.textContent=h; tr.appendChild(th); });
+  tblHead.appendChild(tr);
+  rows.forEach(r => {
+    const tr = document.createElement('tr');
+    headers.forEach(h => { const td=document.createElement('td'); td.textContent = r[h]; tr.appendChild(td); });
+    tblBody.appendChild(tr);
+  });
+}
+
+function progressUI(kind, pct, text){
+  document.getElementById('bar'+kind).style.width = (pct||0) + '%';
+  document.getElementById('status'+kind).textContent = text || '';
+}
+
+function params(kind){
+  const isAfter = kind === 'A';
+  const p = {
+    tickers: document.getElementById('tickers'+kind).value.trim(),
+    minBidTheo: document.getElementById('minBidTheo'+kind).value,
+    minVol: document.getElementById('minVol'+kind).value,
+    minOI: document.getElementById('minOI'+kind).value,
+    maxDTE: document.getElementById('maxDTE'+kind).value,
+    near: document.getElementById('near'+kind).value,
+    exp: document.getElementById('exp'+kind).value,
+    concurrency: document.getElementById('concurrency'+kind).value,
+    limit: document.getElementById('limit'+kind).value,
+    mode: isAfter ? 'afterhours' : 'regular'
+  };
+  if (isAfter){
+    p.minIntrinsic = document.getElementById('minIntrinsicA').value;
+    p.intrinsic = document.getElementById('intrinsicA').checked ? '1' : '0';
+    p.intrinsicOnly = document.getElementById('intrinsicOnlyA').checked ? '1' : '0';
+  }
+  return p;
+}
+
+function startSSE(kind){
+  const isAfter = kind === 'A';
+  const btn = document.getElementById('runBtn'+kind);
+  btn.disabled = true; btn.textContent = isAfter ? 'Scanning… (after-hours)' : 'Scanning…';
+  renderTable(kind, []);
+  progressUI(kind, 0, 'Starting…');
+
+  const q = new URLSearchParams(params(kind));
+  q.set('t', String(Date.now())); // cache buster to avoid stale connections
+  const es = new EventSource('/api/scan_sse?' + q.toString());
+
+  let total = 0;
+  es.addEventListener('start', (e) => {
+    const data = JSON.parse(e.data);
+    total = data.total || 0;
+    progressUI(kind, 0, `Queued ${total} tickers…`);
+  });
+
+  es.addEventListener('progress', (e) => {
+    const d = JSON.parse(e.data);
+    const pct = d.pct || 0;
+    progressUI(kind, pct, `Scanning ${d.done}/${d.total} (${pct}%)`);
+  });
+
+  es.addEventListener('hits', (e) => {
+    const d = JSON.parse(e.data);
+    // optional: show rolling hit count
+    document.getElementById('status'+kind).textContent =
+      `Scanning… ${d.totalHits} matches so far`;
+  });
+
+  es.addEventListener('done', (e) => {
+    const d = JSON.parse(e.data);
+    progressUI(kind, 100, `Done. Returned ${d.returned} rows.`);
+    renderTable(kind, d.results || []);
+    document.getElementById('csvLink'+kind).href = '/api/scan.csv?' + q.toString();
+    es.close();
+    btn.disabled = false; btn.textContent = isAfter ? 'Run After-hours Scan' : 'Start Scan';
+  });
+
+  es.onerror = () => {
+    progressUI(kind, 0, 'Connection lost. If this persists, click the button to retry.');
+    try { es.close(); } catch {}
+    btn.disabled = false;
+    btn.textContent = isAfter ? 'Run After-hours Scan' : 'Start Scan';
+  };
+}
+
+document.getElementById('runBtnR').addEventListener('click', () => startSSE('R'));
+document.getElementById('runBtnA').addEventListener('click', () => startSSE('A'));
+</script>
+</body>
+</html>
