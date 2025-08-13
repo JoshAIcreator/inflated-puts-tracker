@@ -8,6 +8,16 @@ import requests
 from dateutil import parser as dtp
 import streamlit as st
 
+# --- Secrets/env helper ---
+def _get_secret(name: str, default: str = "") -> str:
+    try:
+        # prefer Streamlit Secrets if available (Cloud/local .streamlit/secrets.toml)
+        if hasattr(st, "secrets") and name in st.secrets:
+            return str(st.secrets.get(name, default))
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
 # ==========================
 # Data models & providers
 # ==========================
@@ -206,9 +216,9 @@ with st.sidebar:
     provider_choice = st.selectbox("Provider", ["Tradier", "Polygon", "CSV only"], index=0)
     cred = ""
     if provider_choice == "Tradier":
-        cred = st.text_input("Tradier Token", type="password", value=os.getenv("TRADIER_TOKEN", ""))
+        cred = st.text_input("Tradier Token", type="password", value=_get_secret("TRADIER_TOKEN", ""))
     elif provider_choice == "Polygon":
-        cred = st.text_input("Polygon API Key", type="password", value=os.getenv("POLYGON_KEY", ""))
+        cred = st.text_input("Polygon API Key", type="password", value=_get_secret("POLYGON_KEY", ""))
 
     st.header("Symbols")
     syms_text = st.text_area("Symbols (comma/space/newline separated)",
