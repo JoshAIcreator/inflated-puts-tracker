@@ -1,79 +1,342 @@
-import streamlit as st
-import yfinance as yf
+import os
+import io
+import typing as t
+from datetime import datetime, timezone
+
 import pandas as pd
-from datetime import datetime
-import time
+import requests
+from dateutil import parser as dtp
+import streamlit as st
 
-# Function to calculate days to expiration
-def days_to_expiration(exp_date_str):
-    exp_date = datetime.strptime(exp_date_str, '%Y-%m-%d')
-    today = datetime.today()
-    return max((exp_date - today).days, 1)  # Avoid division by zero
+# ==========================
+# Data models & providers
+# ==========================
 
-st.title("Overpriced Puts Finder App")
+class OptionQuote(t.TypedDict):
+    provider: str
+    option_symbol: str
+    underlying: str
+    type: str  # 'put'/'call'
+    strike: float
+    expiration: str  # ISO date
+    bid: float
+    ask: float
+    last: t.Optional[float]
+    volume: t.Optional[int]
+    open_interest: t.Optional[int]
+    underlying_price: t.Optional[float]
+    exch: t.Optional[str]
+    updated: t.Optional[str]
 
-st.markdown("""
-This app scans S&P 500 stocks for put options where the bid price as a percentage of the strike price meets or exceeds your desired threshold.
-This is calculated as (bid / strike) * 100%.
+class Provider:
+    name: str
+    def get_put_quotes(self, symbol: str, min_dte: int, max_dte: int) -> list[OptionQuote]:
+        raise NotImplementedError
 
-**Note:** A 10% raw return is quite high and may only appear in high-volatility or unusual market conditions. Results may be limited.
-You can also opt to filter by annualized return, which adjusts for the time to expiration: ((bid / strike) * (365 / days_to_exp)) * 100%.
-""")
+# ---- Tradier ----
 
-# User inputs
-desired_percent = st.number_input("Enter desired bid/strike % (e.g., 10 for 10%)", min_value=0.0, value=10.0)
-annualize = st.checkbox("Use annualized return instead?", value=False)
+class TradierProvider(Provider):
+    name = "Tradier"
+    def __init__(self, token: str, endpoint: str = "https://api.tradier.com"):
+        self.token = token
+        self.endpoint = endpoint.rstrip("/")
+        self.session = requests.Session()
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.token}",
+            "Accept": "application/json"
+        })
 
-if st.button("Scan S&P 500 Stocks"):
-    # Fetch S&P 500 tickers
-    try:
-        sp500_url = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
-        sp500 = pd.read_html(sp500_url)[0]['Symbol'].tolist()
-        st.write(f"Scanning {len(sp500)} S&P 500 stocks...")
-    except Exception as e:
-        st.error(f"Error fetching S&P 500 list: {e}")
-        st.stop()
+    def _expirations(self, symbol: str) -> list[str]:
+        url = f"{self.endpoint}/v1/markets/options/expirations"
+        r = self.session.get(url, params={"symbol": symbol, "includeAllRoots": "true", "strikes": "false"}, timeout=30)
+        r.raise_for_status()
+        data = r.json()
+        exps = data.get("expirations", {}).get("date", [])
+        if isinstance(exps, str):
+            exps = [exps]
+        return exps
 
-    results = []
-    progress_bar = st.progress(0)
-    total_stocks = len(sp500)
+    def _chain(self, symbol: str, expiration: str) -> list[dict]:
+        url = f"{self.endpoint}/v1/markets/options/chains"
+        r = self.session.get(url, params={"symbol": symbol, "expiration": expiration, "greeks": "false"}, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        options = data.get("options", {}).get("option", [])
+        if isinstance(options, dict):
+            options = [options]
+        return options
 
-    for i, ticker in enumerate(sp500):
+    def get_put_quotes(self, symbol: str, min_dte: int, max_dte: int) -> list[OptionQuote]:
+        out: list[OptionQuote] = []
+        today = datetime.now(timezone.utc).date()
         try:
-            stock = yf.Ticker(ticker)
-            option_dates = stock.options
-            for exp in option_dates:
-                chain = stock.option_chain(exp)
-                puts = chain.puts
-                puts = puts[puts['bid'] > 0]  # Only consider puts with positive bids
-                if annualize:
-                    puts['days_to_exp'] = days_to_expiration(exp)
-                    puts['percent'] = (puts['bid'] / puts['strike']) * (365 / puts['days_to_exp']) * 100
-                else:
-                    puts['percent'] = (puts['bid'] / puts['strike']) * 100
-                puts['expiration'] = exp
-                puts['ticker'] = ticker
-                filtered = puts[puts['percent'] >= desired_percent]
-                if not filtered.empty:
-                    results.append(filtered[['ticker', 'expiration', 'strike', 'bid', 'percent', 'lastPrice', 'volume', 'openInterest', 'impliedVolatility']])
+            expirations = self._expirations(symbol)
         except Exception:
-            pass  # Skip errors for individual stocks
-        
-        # Update progress
-        progress_bar.progress((i + 1) / total_stocks)
-        time.sleep(0.01)  # Small delay to avoid API rate limits
+            return out
+        for exp in expirations:
+            try:
+                d = dtp.parse(exp).date()
+            except Exception:
+                continue
+            dte = (d - today).days
+            if dte < min_dte or dte > max_dte:
+                continue
+            try:
+                chain = self._chain(symbol, exp)
+            except Exception:
+                continue
+            for c in chain:
+                if str(c.get("option_type", "")).lower() != "put":
+                    continue
+                bid = float(c.get("bid", 0) or 0)
+                ask = float(c.get("ask", 0) or 0)
+                strike = float(c.get("strike", 0) or 0)
+                if strike <= 0:
+                    continue
+                out.append(OptionQuote(
+                    provider=self.name,
+                    option_symbol=str(c.get("symbol", "")),
+                    underlying=symbol,
+                    type="put",
+                    strike=strike,
+                    expiration=str(d),
+                    bid=bid,
+                    ask=ask,
+                    last=float(c.get("last", 0) or 0),
+                    volume=int(c.get("volume", 0) or 0),
+                    open_interest=int(c.get("open_interest", 0) or 0),
+                    underlying_price=float(c.get("underlying_price", 0) or 0),
+                    exch=str(c.get("root_symbol", "")),
+                    updated=None,
+                ))
+        return out
 
-    if results:
-        all_results = pd.concat(results)
-        all_results['impliedVolatility'] = all_results['impliedVolatility'] * 100  # Convert to %
-        all_results.sort_values(by='percent', ascending=False, inplace=True)
-        st.success(f"Found {len(all_results)} put options matching your criteria.")
-        st.dataframe(all_results.style.format({
-            'percent': '{:.2f}%',
-            'impliedVolatility': '{:.2f}%',
-            'bid': '{:.2f}',
-            'lastPrice': '{:.2f}',
-            'strike': '{:.2f}'
-        }))
+# ---- Polygon ----
+
+class PolygonProvider(Provider):
+    name = "Polygon"
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base = "https://api.polygon.io"
+        self.sess = requests.Session()
+
+    def _chain(self, symbol: str, expiration: str) -> list[dict]:
+        params = {
+            "underlying_ticker": symbol,
+            "contract_type": "put",
+            "expiration_date": expiration,
+            "limit": 1000,
+            "apiKey": self.api_key,
+        }
+        r = self.sess.get(f"{self.base}/v3/reference/options/contracts", params=params, timeout=60)
+        r.raise_for_status()
+        data = r.json()
+        results = data.get("results", [])
+        return results
+
+    def _nbbo(self, option_symbol: str) -> dict:
+        r = self.sess.get(f"{self.base}/v3/quotes/{option_symbol}/nbbo/latest", params={"apiKey": self.api_key}, timeout=30)
+        if r.status_code != 200:
+            return {}
+        return r.json().get("results", {})
+
+    def _expirations(self, symbol: str) -> list[str]:
+        r = self.sess.get(f"{self.base}/v3/reference/options/contracts", params={"underlying_ticker": symbol, "limit": 1000, "apiKey": self.api_key}, timeout=60)
+        r.raise_for_status()
+        res = r.json().get("results", [])
+        exps = sorted({x.get("expiration_date") for x in res if x.get("expiration_date")})
+        return exps
+
+    def get_put_quotes(self, symbol: str, min_dte: int, max_dte: int) -> list[OptionQuote]:
+        out: list[OptionQuote] = []
+        today = datetime.now(timezone.utc).date()
+        try:
+            expirations = self._expirations(symbol)
+        except Exception:
+            return out
+        for exp in expirations:
+            try:
+                d = dtp.parse(exp).date()
+            except Exception:
+                continue
+            dte = (d - today).days
+            if dte < min_dte or dte > max_dte:
+                continue
+            try:
+                contracts = self._chain(symbol, exp)
+            except Exception:
+                continue
+            for c in contracts:
+                opt = c.get("ticker") or c.get("options_ticker")
+                if not opt:
+                    continue
+                nbbo = self._nbbo(opt) or {}
+                bid = float(nbbo.get("bid_price", 0) or 0)
+                ask = float(nbbo.get("ask_price", 0) or 0)
+                strike = float(c.get("strike_price", 0) or 0)
+                if strike <= 0:
+                    continue
+                out.append(OptionQuote(
+                    provider=self.name,
+                    option_symbol=opt,
+                    underlying=symbol,
+                    type="put",
+                    strike=strike,
+                    expiration=str(d),
+                    bid=bid,
+                    ask=ask,
+                    last=None,
+                    volume=None,
+                    open_interest=None,
+                    underlying_price=None,
+                    exch=None,
+                    updated=nbbo.get("sip_timestamp"),
+                ))
+        return out
+
+# ==========================
+# UI
+# ==========================
+
+st.set_page_config(page_title="Inflated Put Tracker (Bid/Strike% Scanner)", page_icon="📈", layout="wide")
+st.title("📈 Inflated Put Tracker — Bid/Strike% Scanner")
+
+with st.sidebar:
+    st.header("Data Source")
+    provider_choice = st.selectbox("Provider", ["Tradier", "Polygon", "CSV only"], index=0)
+    cred = ""
+    if provider_choice == "Tradier":
+        cred = st.text_input("Tradier Token", type="password", value=os.getenv("TRADIER_TOKEN", ""))
+    elif provider_choice == "Polygon":
+        cred = st.text_input("Polygon API Key", type="password", value=os.getenv("POLYGON_KEY", ""))
+
+    st.header("Symbols")
+    syms_text = st.text_area("Symbols (comma/space/newline separated)",
+                             value="AAPL, MSFT, TSLA, NVDA, META, AMZN, GOOGL, AMD, NFLX, INTC",
+                             height=90)
+    symbols = sorted({s.strip().upper() for s in syms_text.replace("\n", ",").replace(" ", ",").split(",") if s.strip()})
+
+    st.header("Filters")
+    target_pct = st.number_input("Target Bid/Strike %", min_value=0.0, step=0.5, value=10.0)
+    min_dte = st.number_input("Min DTE (days)", min_value=0, step=1, value=7)
+    max_dte = st.number_input("Max DTE (days)", min_value=1, step=1, value=45)
+    min_bid = st.number_input("Min Bid ($)", min_value=0.0, step=0.05, value=0.10)
+    min_oi = st.number_input("Min Open Interest", min_value=0, step=10, value=50)
+    min_vol = st.number_input("Min Volume (today)", min_value=0, step=10, value=0)
+    moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=0)
+    max_rows = st.slider("Max rows", min_value=100, max_value=5000, value=1000, step=100)
+
+    uploaded_quotes = st.file_uploader("Or upload an option quotes CSV to filter", type=["csv"])  # optional
+    run = st.button("Run scan 🚀")
+
+st.caption("Start with a small list, confirm behavior, then widen to big universes/watchlists.")
+
+def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df["bid"] = pd.to_numeric(df["bid"], errors="coerce").fillna(0.0)
+    df["strike"] = pd.to_numeric(df["strike"], errors="coerce").fillna(0.0)
+    df["bid_strike_pct"] = (df["bid"] / df["strike"]) * 100.0
+    df["expiration"] = pd.to_datetime(df["expiration"], errors="coerce").dt.date.astype(str)
+    df["dte"] = (pd.to_datetime(df["expiration"]) - pd.Timestamp.utcnow().normalize()).dt.days
+    return df
+
+def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
+    df = compute_metrics(df)
+    mask = (
+        (df["bid_strike_pct"] >= float(target_pct)) &
+        (df["dte"].between(int(min_dte), int(max_dte))) &
+        (df["bid"] >= float(min_bid))
+    )
+    if "open_interest" in df.columns:
+        mask &= (pd.to_numeric(df["open_interest"], errors="coerce").fillna(0) >= int(min_oi))
+    if "volume" in df.columns:
+        mask &= (pd.to_numeric(df["volume"], errors="coerce").fillna(0) >= int(min_vol))
+    # optional moneyness if underlying_price available
+    if moneyness != "Any" and "underlying_price" in df.columns and df["underlying_price"].notna().any():
+        up = pd.to_numeric(df["underlying_price"], errors="coerce")
+        if moneyness == "OTM only":
+            mask &= (pd.to_numeric(df["strike"], errors="coerce") < up)
+        elif moneyness == "ITM only":
+            mask &= (pd.to_numeric(df["strike"], errors="coerce") >= up)
+    out = df[mask].sort_values(["bid_strike_pct", "bid"], ascending=[False, False])
+    return out
+
+def collect_live(symbols: list[str], provider_choice: str, cred: str, min_dte: int, max_dte: int) -> pd.DataFrame:
+    if provider_choice == "Tradier":
+        if not cred:
+            st.error("Please enter a Tradier token in the sidebar.")
+            return pd.DataFrame()
+        provider: Provider = TradierProvider(cred)
+    elif provider_choice == "Polygon":
+        if not cred:
+            st.error("Please enter a Polygon API key in the sidebar.")
+            return pd.DataFrame()
+        provider = PolygonProvider(cred)
     else:
-        st.warning("No put options found matching your criteria. Try a lower percentage or enable/disable annualization.")
+        st.error("Unsupported provider selected.")
+        return pd.DataFrame()
+
+    rows: list[OptionQuote] = []
+    errors = []
+    for idx, sym in enumerate(symbols, 1):
+        st.status(f"Fetching {sym} ({idx}/{len(symbols)})", state="running")
+        try:
+            rows.extend(provider.get_put_quotes(sym, int(min_dte), int(max_dte)))
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+            continue
+
+    if errors:
+        with st.expander("Show fetch errors (rate limits / symbols with no data)"):
+            for msg in errors:
+                st.write(msg)
+
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    return df
+
+results = None
+if uploaded_quotes is not None:
+    try:
+        df = pd.read_csv(io.BytesIO(uploaded_quotes.getvalue()))
+        # normalize column names
+        df.columns = [c.strip().lower() for c in df.columns]
+        if "type" in df.columns:
+            df = df[df["type"].str.lower() == "put"]
+        results = filter_rows(df)
+    except Exception as e:
+        st.error(f"CSV error: {e}")
+
+if run and results is None:
+    if not symbols:
+        st.warning("Add at least one symbol or upload a CSV.")
+    elif provider_choice == "CSV only":
+        st.warning("Choose Tradier/Polygon or upload a CSV to scan.")
+    else:
+        live_df = collect_live(symbols, provider_choice, cred, int(min_dte), int(max_dte))
+        if live_df.empty:
+            st.warning("No data returned. Check keys, rate limits, or widen symbols/DTE.")
+        else:
+            results = filter_rows(live_df)
+
+if results is not None:
+    if results.empty:
+        st.warning("No matches with current filters. Try lowering Target %, widening DTE, or increasing Min Bid/LIQ filters.")
+    else:
+        st.success(f"Found {len(results)} matching puts.")
+        show_cols = [
+            "provider","option_symbol","underlying","type","strike","expiration","bid","ask",
+            "bid_strike_pct","dte","volume","open_interest","underlying_price","updated"
+        ]
+        show_cols = [c for c in show_cols if c in results.columns]
+        st.dataframe(results[show_cols].head(int(max_rows)), use_container_width=True)
+        st.download_button("Download CSV", results.to_csv(index=False).encode(), file_name="inflated_puts.csv", mime="text/csv")
+
+with st.expander("Notes & sanity checks"):
+    st.markdown("""
+- This flags math-based premium richness: **Bid/Strike %**. Always evaluate spreads, IV, borrow, earnings, and assignment risk.
+- Use **Min Bid**, **OI**, **Volume** to avoid illiquid/stale quotes.
+- Typical windows: **7–21 DTE** for short premium, **30–60 DTE** for broader.
+- For earnings crush plays: avoid tickers that ran up pre-event unless you're comfortable with gap risk.
+""")
