@@ -248,12 +248,15 @@ else:
 
 with st.sidebar:
     st.header("Data Source")
-    provider_choice = st.selectbox("Provider", ["Tradier", "Polygon", "CSV only"], index=0)
+    _poly_key_default = _get_secret("POLYGON_KEY", "")
+    _default_provider_index = 1 if _poly_key_default else 0
+    provider_choice = st.selectbox("Provider", ["Tradier", "Polygon", "CSV only"], index=_default_provider_index)
     cred = ""
     if provider_choice == "Tradier":
         cred = st.text_input("Tradier Token", type="password", value=_get_secret("TRADIER_TOKEN", ""))
     elif provider_choice == "Polygon":
-        cred = st.text_input("Polygon API Key", type="password", value=_get_secret("POLYGON_KEY", ""))
+        # Prefill Polygon key from secrets/env if present
+        cred = st.text_input("Polygon API Key", type="password", value=_poly_key_default)
 
     st.header("Symbols")
 
@@ -424,6 +427,67 @@ BENZ_NEWS_HEADERS = {
     "Cache-Control": "no-cache",
 }
 
+# --- MarketBeat and EarningsWhispers single-ticker fallback headers and scrapers ---
+MB_HEADERS = {
+    "User-Agent": YF_PAGE_HEADERS["User-Agent"],
+    "Accept": YF_PAGE_HEADERS["Accept"],
+    "Accept-Language": YF_PAGE_HEADERS["Accept-Language"],
+    "Cache-Control": "no-cache",
+}
+
+def _earnings_from_marketbeat(symbol: str) -> list[dict]:
+    """Scrape MarketBeat single-ticker earnings page for a date (best-effort)."""
+    import re
+    sym = symbol.strip().upper()
+    out: list[dict] = []
+    bases = [
+        f"https://www.marketbeat.com/stocks/NASDAQ/{sym}/earnings/",
+        f"https://www.marketbeat.com/stocks/NYSE/{sym}/earnings/",
+    ]
+    pat_iso = re.compile(r"(20\d{2}-\d{2}-\d{2})")
+    pat_long = re.compile(r"([A-Z][a-z]+\s+\d{1,2},\s+20\d{2})")
+    for url in bases:
+        try:
+            r = requests.get(url, headers=MB_HEADERS, timeout=30)
+            if r.status_code != 200 or not r.text:
+                continue
+            html = r.text
+            m = pat_iso.search(html) or pat_long.search(html)
+            if m:
+                dt_txt = m.group(1)
+                try:
+                    dt = pd.to_datetime(dt_txt, errors="coerce").date()
+                    if pd.notnull(dt):
+                        out.append({"source": "MarketBeat", "date": dt})
+                        break
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return out
+
+
+def _earnings_from_earningswhispers_single(symbol: str) -> list[dict]:
+    """Best‑effort scrape of EarningsWhispers single-ticker page for a date."""
+    import re
+    sym = symbol.strip().lower()
+    url = f"https://www.earningswhispers.com/stocks/{sym}"
+    out: list[dict] = []
+    try:
+        r = requests.get(url, headers=EW_HEADERS, timeout=30)
+        if r.status_code != 200 or not r.text:
+            return out
+        html = r.text
+        m = re.search(r"(20\d{2}-\d{2}-\d{2})", html) or re.search(r"([A-Z][a-z]+\s+\d{1,2},\s+20\d{2})", html)
+        if m:
+            dt_txt = m.group(1)
+            dt = pd.to_datetime(dt_txt, errors="coerce").date()
+            if pd.notnull(dt):
+                out.append({"source": "EarningsWhispers", "date": dt})
+    except Exception:
+        pass
+    return out
+
 def _earnings_from_yahoo(symbol: str) -> list[dict]:
     """Return list of {source,date} from Yahoo quoteSummary calendarEvents/earnings."""
     out = []
@@ -519,6 +583,9 @@ def get_symbol_earnings_multi(symbol: str, polygon_key: str | None = None) -> pd
     rows += _earnings_from_yahoo(symbol)
     rows += _earnings_from_yahoo_quote(symbol)
     rows += _earnings_from_polygon(symbol, polygon_key)
+    # Additional public web fallbacks
+    rows += _earnings_from_marketbeat(symbol)
+    rows += _earnings_from_earningswhispers_single(symbol)
     # 2) range fallback
     try:
         start = (pd.Timestamp.utcnow().normalize() - pd.Timedelta(days=30)).date()
@@ -974,29 +1041,67 @@ def fetch_benzinga_news_for_date(symbol: str, day: pd.Timestamp) -> pd.DataFrame
 with earn_ticker_tab:
     st.header("🔎 Single Ticker Earnings (multi‑source)")
     colx, coly = st.columns([2,1])
+
+    # allow multiple tickers, comma/space/newline separated (case-insensitive)
+    def _parse_syms_inline(text: str) -> list[str]:
+        raw = (text or "").replace("\n", ",").replace("\t", ",").replace(" ", ",")
+        return [s.strip().upper() for s in raw.split(",") if s.strip()]
+
     with colx:
-        q_symbol = st.text_input("Enter ticker", value="", placeholder="e.g., CSCO", key="earn_sym_input")
+        q_symbols_text = st.text_input(
+            "Enter ticker(s)",
+            value="",
+            placeholder="e.g., AAPL, MSFT (comma/space/newline separated)",
+            key="earn_syms_input",
+        )
     with coly:
         if provider_choice == "Polygon" and cred:
             st.caption("Polygon key detected — will include Polygon where available.")
         else:
             st.caption("Uses Yahoo; add Polygon key to include Polygon.")
-    run_sym = st.button("Check earnings dates", key="btn_check_earn_dates")
-    if run_sym and q_symbol.strip():
-        df_sym = get_symbol_earnings_multi(q_symbol.strip(), cred if provider_choice == "Polygon" else None)
-        if df_sym.empty:
-            st.warning("No earnings dates found from the current sources.")
-        else:
-            try:
-                df_sym = df_sym.sort_values(["date","source"]).drop_duplicates(["date"]).reset_index(drop=True)
-            except Exception:
-                pass
-            st.dataframe(df_sym, use_container_width=True)
 
-        # Benzinga news/press for today (helps catch PRs around earnings)
-        if q_symbol.strip():
+    run_sym = st.button("Check earnings dates", key="btn_check_earn_dates")
+
+    if run_sym:
+        syms = _parse_syms_inline(q_symbols_text)
+        if not syms:
+            st.warning("Enter at least one ticker (comma/space/newline separated).")
+        else:
+            all_rows: list[pd.DataFrame] = []
+            miss: list[str] = []
+            for s in syms:
+                df_s = get_symbol_earnings_multi(s, cred if provider_choice == "Polygon" else None)
+                if df_s is None or df_s.empty:
+                    miss.append(s)
+                else:
+                    all_rows.append(df_s)
+
+            if all_rows:
+                df_sym = pd.concat(all_rows, ignore_index=True)
+                try:
+                    df_sym = (
+                        df_sym
+                        .dropna(subset=["date"])  # guard
+                        .sort_values(["symbol","date","source"])
+                        .drop_duplicates(["symbol","date"])  # one row per symbol/date
+                        .reset_index(drop=True)
+                    )
+                except Exception:
+                    pass
+                st.dataframe(df_sym, use_container_width=True)
+                st.caption("Tip: tickers are normalized to uppercase; you can paste them in any case.")
+            else:
+                st.warning("No earnings dates found from the current sources.")
+
+            if miss:
+                st.warning(f"No earnings dates found from current sources for: {', '.join(miss)}")
+
+        # Benzinga news/press for today — show only when a single symbol is provided to avoid noise
+        syms_for_news = _parse_syms_inline(q_symbols_text)
+        if len(syms_for_news) == 1:
+            one_sym = syms_for_news[0]
             st.subheader("📰 News / Press Releases (Benzinga — today)")
-            news_df = fetch_benzinga_news_for_date(q_symbol.strip(), pd.Timestamp.utcnow().date())
+            news_df = fetch_benzinga_news_for_date(one_sym, pd.Timestamp.utcnow().date())
             if news_df.empty:
                 st.caption("No Benzinga items detected for today.")
             else:
