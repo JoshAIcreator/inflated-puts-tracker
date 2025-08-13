@@ -221,10 +221,53 @@ with st.sidebar:
         cred = st.text_input("Polygon API Key", type="password", value=_get_secret("POLYGON_KEY", ""))
 
     st.header("Symbols")
-    syms_text = st.text_area("Symbols (comma/space/newline separated)",
-                             value="AAPL, MSFT, TSLA, NVDA, META, AMZN, GOOGL, AMD, NFLX, INTC",
-                             height=90)
-    symbols = sorted({s.strip().upper() for s in syms_text.replace("\n", ",").replace(" ", ",").split(",") if s.strip()})
+
+    def _parse_symbols(text: str) -> list[str]:
+        raw = text.replace("\n", ",").replace("\t", ",").replace(" ", ",")
+        return sorted({s.strip().upper() for s in raw.split(",") if s.strip()})
+
+    # Default to using the repo universe file (no prefill)
+    symbol_source = st.radio("Choose symbols from:", ["Custom input", "Repo list file"], index=1, horizontal=True)
+
+    repo_dir = os.path.dirname(__file__)
+    fallback_dir = os.path.expanduser("~/Documents/inflated-puts-tracker")
+    candidate_files = [
+        os.path.join(repo_dir, "universe_all.txt"),
+        os.path.join(repo_dir, "universe.txt"),
+        os.path.join(repo_dir, "symbols.txt"),
+        os.path.join(repo_dir, "nasdaqlisted.txt"),
+        os.path.join(repo_dir, "otherlisted.txt"),
+        os.path.join(fallback_dir, "universe_all.txt"),
+        os.path.join(fallback_dir, "universe.txt"),
+        os.path.join(fallback_dir, "nasdaqlisted.txt"),
+        os.path.join(fallback_dir, "otherlisted.txt"),
+    ]
+    existing_files = [p for p in candidate_files if os.path.exists(p)]
+
+    symbols: list[str] = []
+    if symbol_source == "Custom input":
+        syms_text = st.text_area(
+            "Symbols (comma/space/newline separated)",
+            value="",  # no prefill
+            height=90,
+        )
+        symbols = _parse_symbols(syms_text)
+    else:
+        if not existing_files:
+            st.error("No universe file found in the repo. Expected `universe_all.txt`, `universe.txt`, `nasdaqlisted.txt`, or `otherlisted.txt`.")
+            symbols = []
+        else:
+            chosen_file = st.selectbox("Universe file", existing_files, format_func=lambda p: os.path.basename(p))
+            try:
+                with open(chosen_file, "r", encoding="utf-8", errors="ignore") as fh:
+                    content = fh.read()
+                symbols = _parse_symbols(content)
+            except Exception as e:
+                st.error(f"Failed to read universe file: {e}")
+                symbols = []
+        symbol_limit = st.number_input("(Optional) Limit number of symbols to scan", min_value=50, step=50, value=min(7000, max(50, len(symbols) or 50)))
+        if symbols:
+            symbols = symbols[: int(symbol_limit)]
 
     st.header("Filters")
     target_pct = st.number_input("Target Bid/Strike %", min_value=0.0, step=0.5, value=10.0)
@@ -289,7 +332,7 @@ def collect_live(symbols: list[str], provider_choice: str, cred: str, min_dte: i
     rows: list[OptionQuote] = []
     errors = []
     for idx, sym in enumerate(symbols, 1):
-        st.status(f"Fetching {sym} ({idx}/{len(symbols)})", state="running")
+        st.progress(int(idx / max(1, len(symbols)) * 100), text=f"Fetching {sym} ({idx}/{len(symbols)})")
         try:
             rows.extend(provider.get_put_quotes(sym, int(min_dte), int(max_dte)))
         except Exception as e:
