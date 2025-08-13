@@ -332,11 +332,22 @@ scan_tab, earn_ticker_tab, earn_cal_tab, earn_list_tab = st.tabs([
 
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df["bid"] = pd.to_numeric(df["bid"], errors="coerce").fillna(0.0)
-    df["strike"] = pd.to_numeric(df["strike"], errors="coerce").fillna(0.0)
-    df["bid_strike_pct"] = (df["bid"] / df["strike"]) * 100.0
-    df["expiration"] = pd.to_datetime(df["expiration"], errors="coerce").dt.date.astype(str)
-    df["dte"] = (pd.to_datetime(df["expiration"]) - pd.Timestamp.utcnow().normalize()).dt.days
+    # Robust numeric parsing
+    df["bid"] = pd.to_numeric(df.get("bid"), errors="coerce").fillna(0.0)
+    df["strike"] = pd.to_numeric(df.get("strike"), errors="coerce").fillna(0.0)
+    # Avoid divide-by-zero (NaN then fill)
+    denom = df["strike"].replace(0, pd.NA)
+    df["bid_strike_pct"] = (df["bid"].astype(float) / denom).astype(float) * 100.0
+    df["bid_strike_pct"] = df["bid_strike_pct"].fillna(0.0)
+
+    # Parse expiration to datetime once; tolerate bad values
+    exp_dt = pd.to_datetime(df.get("expiration"), errors="coerce")
+    df["expiration"] = exp_dt.dt.date.astype("string")
+
+    # Compute DTE defensively (NaT -> NaN)
+    today_norm = pd.Timestamp.utcnow().normalize()
+    dte_series = (exp_dt.dt.normalize() - today_norm).dt.days
+    df["dte"] = pd.to_numeric(dte_series, errors="coerce")
     return df
 
 def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
