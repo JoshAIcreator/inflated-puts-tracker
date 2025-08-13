@@ -425,24 +425,66 @@ BENZ_NEWS_HEADERS = {
 }
 
 def _earnings_from_yahoo(symbol: str) -> list[dict]:
-    """Return list of {source,date} from Yahoo quoteSummary calendarEvents."""
+    """Return list of {source,date} from Yahoo quoteSummary calendarEvents/earnings."""
     out = []
     try:
         url = f"https://query2.finance.yahoo.com/v10/finance/quoteSummary/{symbol}"
-        r = requests.get(url, params={"modules": "calendarEvents"}, headers=YF_HEADERS, timeout=20)
+        # Request both modules; some tickers only populate one
+        params = {"modules": "calendarEvents,earnings"}
+        r = requests.get(url, params=params, headers=YF_HEADERS, timeout=20)
         r.raise_for_status()
-        js = r.json()
-        res = (js.get("quoteSummary", {}) or {}).get("result", [])
-        if res:
-            earn = (res[0].get("calendarEvents", {}) or {}).get("earnings", {})
-            dates = earn.get("earningsDate") or []
-            for d in dates:
-                # Yahoo returns objects with 'fmt' (e.g., '2025-08-13') or epoch 'raw'
+        js = r.json() or {}
+        res = (js.get("quoteSummary", {}) or {}).get("result", []) or []
+        if not res:
+            return out
+        node = res[0] or {}
+        cal = node.get("calendarEvents") or {}
+        earn = cal.get("earnings") or {}
+        dates = earn.get("earningsDate") or []
+        for d in dates:
+            dt = None
+            if isinstance(d, dict):
                 dt = d.get("fmt") or d.get("raw")
-                if isinstance(dt, (int, float)):
-                    dt = pd.to_datetime(dt, unit="s", utc=True).date().isoformat()
-                if isinstance(dt, str):
-                    out.append({"source": "Yahoo", "date": pd.to_datetime(dt, errors="coerce").date()})
+            else:
+                dt = d
+            if isinstance(dt, (int, float)):
+                dt = pd.to_datetime(dt, unit="s", utc=True).date().isoformat()
+            if isinstance(dt, str):
+                out.append({"source": "Yahoo", "date": pd.to_datetime(dt, errors="coerce").date()})
+        # Fallback: sometimes currentQuarterDate appears only under earningsChart
+        enode = node.get("earnings") or {}
+        qd = (enode.get("earningsChart") or {}).get("currentQuarterDate")
+        if qd and not any(x.get("date") for x in out):
+            try:
+                out.append({"source": "Yahoo", "date": pd.to_datetime(qd).date()})
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+# --- Yahoo v7 quote fallback (earningsTimestamp window) ---
+
+def _earnings_from_yahoo_quote(symbol: str) -> list[dict]:
+    out: list[dict] = []
+    try:
+        base = "https://query1.finance.yahoo.com/v7/finance/quote"
+        r = requests.get(base, params={"symbols": symbol}, headers=YF_HEADERS, timeout=20)
+        if r.status_code != 200:
+            return out
+        res = (r.json() or {}).get("quoteResponse", {}).get("result", [])
+        if not res:
+            return out
+        row = res[0]
+        for key in ("earningsTimestamp", "earningsTimestampStart", "earningsTimestampEnd"):
+            val = row.get(key)
+            if not val:
+                continue
+            try:
+                d = pd.to_datetime(int(val), unit="s", utc=True).date()
+                out.append({"source": "YahooQuote", "date": d})
+            except Exception:
+                continue
     except Exception:
         pass
     return out
@@ -475,6 +517,7 @@ def get_symbol_earnings_multi(symbol: str, polygon_key: str | None = None) -> pd
     rows: list[dict] = []
     # 1) direct
     rows += _earnings_from_yahoo(symbol)
+    rows += _earnings_from_yahoo_quote(symbol)
     rows += _earnings_from_polygon(symbol, polygon_key)
     # 2) range fallback
     try:
@@ -883,6 +926,11 @@ def fetch_benzinga_news_for_date(symbol: str, day: pd.Timestamp) -> pd.DataFrame
             html = r.text
             for m in re.finditer(r'<a\s+[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL):
                 href = m.group(1)
+                # Require the ticker to appear in the link/title/context to avoid generic category links
+                href_l = href.lower()
+                if (f"/stock/{sym}" not in href_l) and (f"symbol={sym}" not in href_l) and (sym not in href_l):
+                    # we will also check title below; if both miss we skip later
+                    pass
                 if ("/news/" not in href and 
                     "/pressrelease" not in href and 
                     "/press-releases" not in href and 
@@ -895,6 +943,9 @@ def fetch_benzinga_news_for_date(symbol: str, day: pd.Timestamp) -> pd.DataFrame
                 around = html[max(0, m.start()-300): m.end()+300]
                 dt_match = re.search(r'datetime="([0-9T:\-\+Z]+)"', around)
                 ts = dt_match.group(1) if dt_match else None
+                title_l = title.lower()
+                if (sym not in title_l) and (f"/stock/{sym}" not in href_l) and (sym not in href_l):
+                    continue
                 rows.append({
                     "time": ts,
                     "title": title,
@@ -936,6 +987,10 @@ with earn_ticker_tab:
         if df_sym.empty:
             st.warning("No earnings dates found from the current sources.")
         else:
+            try:
+                df_sym = df_sym.sort_values(["date","source"]).drop_duplicates(["date"]).reset_index(drop=True)
+            except Exception:
+                pass
             st.dataframe(df_sym, use_container_width=True)
 
         # Benzinga news/press for today (helps catch PRs around earnings)
