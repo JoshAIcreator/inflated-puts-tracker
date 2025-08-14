@@ -155,6 +155,37 @@ class PolygonProvider(Provider):
         self.base = "https://api.polygon.io"
         self.sess = requests.Session()
 
+    def _trade_latest(self, option_symbol: str) -> float:
+        """Return latest trade price for an option symbol (0.0 if unavailable)."""
+        try:
+            r = self.sess.get(
+                f"{self.base}/v3/trades/{option_symbol}/latest",
+                params={"apiKey": self.api_key},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                px = (r.json() or {}).get("results", {}).get("price")
+                return float(px or 0)
+        except Exception:
+            pass
+        return 0.0
+
+    def _prev_close(self, option_symbol: str) -> float:
+        """Return previous close price for an option symbol (0.0 if unavailable)."""
+        try:
+            r = self.sess.get(
+                f"{self.base}/v2/aggs/ticker/{option_symbol}/prev",
+                params={"adjusted": "true", "apiKey": self.api_key},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                results = (r.json() or {}).get("results") or []
+                if results:
+                    return float(results[0].get("c") or 0)  # previous close
+        except Exception:
+            pass
+        return 0.0
+
     def _chain(self, symbol: str, expiration: str) -> list[dict]:
         params = {
             "underlying_ticker": symbol,
@@ -208,6 +239,12 @@ class PolygonProvider(Provider):
                 nbbo = self._nbbo(opt) or {}
                 bid = float(nbbo.get("bid_price", 0) or 0)
                 ask = float(nbbo.get("ask_price", 0) or 0)
+                # Fallback for after-hours when NBBO often returns 0/0
+                last_px = 0.0
+                if bid <= 0 and ask <= 0:
+                    last_px = self._trade_latest(opt)
+                    if last_px <= 0:
+                        last_px = self._prev_close(opt)
                 strike = float(c.get("strike_price", 0) or 0)
                 if strike <= 0:
                     continue
@@ -220,7 +257,7 @@ class PolygonProvider(Provider):
                     expiration=str(d),
                     bid=bid,
                     ask=ask,
-                    last=None,
+                    last=last_px if last_px > 0 else None,
                     volume=None,
                     open_interest=None,
                     underlying_price=None,
