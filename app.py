@@ -158,6 +158,20 @@ class PolygonProvider(Provider):
         self.sess = requests.Session()
         self._qcache: dict[str, tuple[float, float, float]] = {}
 
+    def _underlying_last(self, symbol: str) -> float:
+        """Return last trade price for the underlying (0.0 if unavailable)."""
+        try:
+            r = self.sess.get(
+                f"{self.base}/v2/last/trade/{symbol}",
+                params={"apiKey": self.api_key},
+                timeout=10,
+            )
+            if r.status_code == 200:
+                return float(((r.json() or {}).get("results") or {}).get("p") or 0.0)
+        except Exception:
+            pass
+        return 0.0
+
     def _trade_latest(self, option_symbol: str) -> float:
         """Return latest trade price for an option symbol (0.0 if unavailable)."""
         try:
@@ -272,6 +286,7 @@ class PolygonProvider(Provider):
         """
         out: list[OptionQuote] = []
         today = datetime.now(timezone.utc).date()
+        underly_px = self._underlying_last(symbol)
 
         try:
             for c in self._iter_contracts(symbol):
@@ -327,7 +342,7 @@ class PolygonProvider(Provider):
                     last=last_px if last_px > 0 else None,
                     volume=None,
                     open_interest=None,
-                    underlying_price=None,
+                    underlying_price=underly_px if underly_px > 0 else None,
                     exch=None,
                     updated=nbbo.get("sip_timestamp"),
                 ))
@@ -422,7 +437,7 @@ with st.sidebar:
     min_bid = st.number_input("Min Bid ($)", min_value=0.0, step=0.05, value=0.10)
     min_oi = st.number_input("Min Open Interest", min_value=0, step=10, value=50)
     min_vol = st.number_input("Min Volume (today)", min_value=0, step=10, value=0)
-    moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=0)
+    moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=1)
 
     use_mark_fallback = st.checkbox("Use mid price when bid = 0 (fallback)", value=True)
     st.session_state["use_mark_fallback"] = use_mark_fallback
