@@ -341,12 +341,12 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["bid_strike_pct"] = df["bid_strike_pct"].fillna(0.0)
 
     # Parse expiration to datetime once; tolerate bad values
-    exp_dt = pd.to_datetime(df.get("expiration"), errors="coerce")
-    df["expiration"] = exp_dt.dt.date.astype("string")
+    exp = pd.to_datetime(df.get("expiration"), errors="coerce")
+    df["expiration"] = exp.dt.date.astype("string")
 
     # Compute DTE defensively (NaT -> NaN)
-    today_norm = pd.Timestamp.utcnow().normalize()
-    dte_series = (exp_dt.dt.normalize() - today_norm).dt.days
+    today_norm = pd.Timestamp.today().normalize()
+    dte_series = (exp.dt.normalize() - today_norm).dt.days
     df["dte"] = pd.to_numeric(dte_series, errors="coerce")
     return df
 
