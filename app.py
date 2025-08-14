@@ -310,7 +310,7 @@ with st.sidebar:
     st.header("Filters")
     target_pct = st.number_input("Target Bid/Strike %", min_value=0.0, step=0.5, value=10.0)
     min_dte = st.number_input("Min DTE (days)", min_value=0, step=1, value=7)
-    max_dte = st.number_input("Max DTE (days)", min_value=1, step=1, value=45)
+    max_dte = st.number_input("Max DTE (days)", min_value=1, step=1, value=730)
     min_bid = st.number_input("Min Bid ($)", min_value=0.0, step=0.05, value=0.10)
     min_oi = st.number_input("Min Open Interest", min_value=0, step=10, value=50)
     min_vol = st.number_input("Min Volume (today)", min_value=0, step=10, value=0)
@@ -957,6 +957,32 @@ with scan_tab:
             if live_df.empty:
                 st.warning("No data returned. Check keys, rate limits, or widen symbols/DTE.")
             else:
+                # Pre-filter diagnostics
+                pre = compute_metrics(live_df)
+                total = len(pre)
+                dte_mask = pre["dte"].between(int(min_dte), int(max_dte))
+                bid_mask = pre["bid"] >= float(min_bid)
+                pre_in_dte = int(dte_mask.sum())
+                pre_bid_ok = int((dte_mask & bid_mask).sum())
+                st.caption(
+                    f"Diagnostics — rows: {total} | in DTE range: {pre_in_dte} | in DTE and bid≥min: {pre_bid_ok}. "
+                    f"(Target Bid/Strike % filter applied later: ≥{float(target_pct):.2f}%)"
+                )
+                try:
+                    show_sample = bool(dbg_sample)
+                except NameError:
+                    show_sample = False
+                if show_sample:
+                    st.subheader("Sample before filters (top 20 by Bid/Strike %)")
+                    cols = [c for c in [
+                        "provider","option_symbol","underlying","strike","expiration","bid","ask",
+                        "bid_strike_pct","dte","open_interest","volume"
+                    ] if c in pre.columns]
+                    st.dataframe(
+                        pre.sort_values(["bid_strike_pct","bid"], ascending=[False, False])[cols].head(20),
+                        use_container_width=True,
+                    )
+                # Now filter normally
                 results = filter_rows(live_df)
 
     if results is not None:

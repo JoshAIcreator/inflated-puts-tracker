@@ -1,0 +1,9 @@
+# Query: max_rows = st.slider("Max rows", min_value=100, max_value=5000, value=1000, step=100)
+# ContextLines: 1
+
+1 result - 1 file
+
+app.py:
+  317      moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=0)
+  318:     max_rows = st.slider("Max rows", min_value=100, max_value=5000, value=1000, step=100)
+  319  dbg_sample = st.checkbox("Debug: show top 20 before filters", value=False)
