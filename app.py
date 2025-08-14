@@ -7,6 +7,8 @@ import pandas as pd
 import requests
 from dateutil import parser as dtp
 import streamlit as st
+from dateutil import tz as dttz
+from datetime import time as _dtime
 
 # --- Secrets/env helper ---
 
@@ -154,6 +156,7 @@ class PolygonProvider(Provider):
         self.api_key = api_key
         self.base = "https://api.polygon.io"
         self.sess = requests.Session()
+        self._qcache: dict[str, tuple[float, float, float]] = {}
 
     def _trade_latest(self, option_symbol: str) -> float:
         """Return latest trade price for an option symbol (0.0 if unavailable)."""
@@ -186,19 +189,74 @@ class PolygonProvider(Provider):
             pass
         return 0.0
 
-    def _chain(self, symbol: str, expiration: str) -> list[dict]:
+    def _is_after_hours_et(self) -> bool:
+        """Return True if now is outside ~9:30–16:05 ET trading session."""
+        try:
+            now_utc = datetime.now(timezone.utc)
+            et = dttz.gettz("America/New_York")
+            now_et = now_utc.astimezone(et)
+            t = now_et.time()
+            return (t >= _dtime(16, 5)) or (t < _dtime(9, 30))
+        except Exception:
+            return True
+
+    def _snapshot_quote(self, option_symbol: str) -> tuple[float, float, float]:
+        """Best-effort snapshot fallback: (bid, ask, last). Caches by option symbol."""
+        try:
+            if option_symbol in self._qcache:
+                return self._qcache[option_symbol]
+            r = self.sess.get(
+                f"{self.base}/v3/snapshot/options/{option_symbol}",
+                params={"apiKey": self.api_key},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                js = (r.json() or {}).get("results", {}) or {}
+                lq = js.get("last_quote") or {}
+                bid = float(lq.get("bid", 0) or 0)
+                ask = float(lq.get("ask", 0) or 0)
+                lt = js.get("last_trade") or {}
+                last = float(lt.get("price", 0) or 0)
+                if last <= 0:
+                    last = float((js.get("day") or {}).get("close", 0) or 0)
+                tup = (bid, ask, last)
+                self._qcache[option_symbol] = tup
+                return tup
+        except Exception:
+            pass
+        return 0.0, 0.0, 0.0
+
+    def _iter_contracts(self, symbol: str) -> t.Iterator[dict]:
+        """
+        Yield reference option contracts for an underlying across *all* pages.
+        This avoids the default 1000-result cap that was hiding far-dated expirations.
+        """
         params = {
             "underlying_ticker": symbol,
             "contract_type": "put",
-            "expiration_date": expiration,
             "limit": 1000,
             "apiKey": self.api_key,
         }
-        r = self.sess.get(f"{self.base}/v3/reference/options/contracts", params=params, timeout=60)
-        r.raise_for_status()
-        data = r.json()
-        results = data.get("results", [])
-        return results
+        url = f"{self.base}/v3/reference/options/contracts"
+        while True:
+            r = self.sess.get(url, params=params, timeout=60)
+            r.raise_for_status()
+            js = r.json() or {}
+            results = js.get("results") or []
+            for row in results:
+                yield row
+            # polygon v3 returns either 'next_url' or a cursor token
+            next_url = js.get("next_url")
+            next_cursor = js.get("next_cursor") or js.get("cursor")
+            if next_url:
+                # When next_url is absolute, call it directly; otherwise pass cursor
+                url = next_url
+                params = {}  # next_url already has query string incl. apiKey
+            elif next_cursor:
+                url = f"{self.base}/v3/reference/options/contracts"
+                params = {"cursor": next_cursor, "apiKey": self.api_key}
+            else:
+                break
 
     def _nbbo(self, option_symbol: str) -> dict:
         r = self.sess.get(f"{self.base}/v3/quotes/{option_symbol}/nbbo/latest", params={"apiKey": self.api_key}, timeout=30)
@@ -206,55 +264,64 @@ class PolygonProvider(Provider):
             return {}
         return r.json().get("results", {})
 
-    def _expirations(self, symbol: str) -> list[str]:
-        r = self.sess.get(f"{self.base}/v3/reference/options/contracts", params={"underlying_ticker": symbol, "limit": 1000, "apiKey": self.api_key}, timeout=60)
-        r.raise_for_status()
-        res = r.json().get("results", [])
-        exps = sorted({x.get("expiration_date") for x in res if x.get("expiration_date")})
-        return exps
-
     def get_put_quotes(self, symbol: str, min_dte: int, max_dte: int) -> list[OptionQuote]:
+        """
+        Paginate through Polygon reference contracts so we include *all* expirations.
+        For each contract within the requested DTE window, fetch NBBO and
+        apply robust after-hours fallbacks to populate bid/ask/last.
+        """
         out: list[OptionQuote] = []
         today = datetime.now(timezone.utc).date()
+
         try:
-            expirations = self._expirations(symbol)
-        except Exception:
-            return out
-        for exp in expirations:
-            try:
-                d = dtp.parse(exp).date()
-            except Exception:
-                continue
-            dte = (d - today).days
-            if dte < min_dte or dte > max_dte:
-                continue
-            try:
-                contracts = self._chain(symbol, exp)
-            except Exception:
-                continue
-            for c in contracts:
+            for c in self._iter_contracts(symbol):
+                # Basic contract fields
                 opt = c.get("ticker") or c.get("options_ticker")
                 if not opt:
                     continue
-                nbbo = self._nbbo(opt) or {}
-                bid = float(nbbo.get("bid_price", 0) or 0)
-                ask = float(nbbo.get("ask_price", 0) or 0)
-                # Fallback for after-hours when NBBO often returns 0/0
-                last_px = 0.0
-                if bid <= 0 and ask <= 0:
-                    last_px = self._trade_latest(opt)
-                    if last_px <= 0:
-                        last_px = self._prev_close(opt)
+                try:
+                    exp_txt = c.get("expiration_date") or c.get("expiration")
+                    exp_date = dtp.parse(str(exp_txt)).date()
+                except Exception:
+                    continue
+
+                # DTE filter
+                dte = (exp_date - today).days
+                if dte < min_dte or dte > max_dte:
+                    continue
+
                 strike = float(c.get("strike_price", 0) or 0)
                 if strike <= 0:
                     continue
+
+                # Primary quote via NBBO
+                nbbo = self._nbbo(opt) or {}
+                bid = float(nbbo.get("bid_price", 0) or 0)
+                ask = float(nbbo.get("ask_price", 0) or 0)
+
+                # Fallbacks (snapshot → last trade → previous close)
+                last_px = 0.0
+                if bid <= 0 and ask <= 0:
+                    s_bid, s_ask, s_last = self._snapshot_quote(opt)
+                    if s_bid > 0 or s_ask > 0:
+                        bid, ask = s_bid, s_ask
+                        last_px = s_last or 0.0
+                    else:
+                        last_px = self._trade_latest(opt)
+                        if last_px <= 0:
+                            last_px = self._prev_close(opt)
+                    # When after-hours, synthesize a mark from last price if needed
+                    if (bid <= 0 and ask <= 0) and last_px > 0 and self._is_after_hours_et():
+                        bid = last_px
+                        ask = last_px
+
                 out.append(OptionQuote(
                     provider=self.name,
                     option_symbol=opt,
                     underlying=symbol,
                     type="put",
                     strike=strike,
-                    expiration=str(d),
+                    expiration=str(exp_date),
                     bid=bid,
                     ask=ask,
                     last=last_px if last_px > 0 else None,
@@ -264,6 +331,10 @@ class PolygonProvider(Provider):
                     exch=None,
                     updated=nbbo.get("sip_timestamp"),
                 ))
+        except Exception:
+            # Fail soft and return whatever we accumulated
+            pass
+
         return out
 
 # ==========================
