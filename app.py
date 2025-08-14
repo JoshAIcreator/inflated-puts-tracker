@@ -315,6 +315,10 @@ with st.sidebar:
     min_oi = st.number_input("Min Open Interest", min_value=0, step=10, value=50)
     min_vol = st.number_input("Min Volume (today)", min_value=0, step=10, value=0)
     moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=0)
+
+    use_mark_fallback = st.checkbox("Use mid price when bid = 0 (fallback)", value=True)
+    st.session_state["use_mark_fallback"] = use_mark_fallback
+
     max_rows = st.slider("Max rows", min_value=100, max_value=5000, value=1000, step=100)
 
     uploaded_quotes = st.file_uploader("Or upload an option quotes CSV to filter", type=["csv"])  # optional
@@ -333,21 +337,38 @@ scan_tab, earn_ticker_tab, earn_cal_tab, earn_list_tab = st.tabs([
 def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     # Robust numeric parsing
-    df["bid"] = pd.to_numeric(df.get("bid"), errors="coerce").fillna(0.0)
+    df["bid"]   = pd.to_numeric(df.get("bid"), errors="coerce").fillna(0.0)
+    df["ask"]   = pd.to_numeric(df.get("ask"), errors="coerce").fillna(0.0)
+    df["last"]  = pd.to_numeric(df.get("last"), errors="coerce").fillna(0.0)
     df["strike"] = pd.to_numeric(df.get("strike"), errors="coerce").fillna(0.0)
-    # Avoid divide-by-zero (NaN then fill)
+
+    # Effective bid: prefer bid; if 0, optionally use mid (bid+ask)/2; then fallback to last
+    try:
+        _use_mark = st.session_state.get("use_mark_fallback", True)
+    except Exception:
+        _use_mark = True
+    eff = df["bid"].copy()
+    # mid price when bid is 0 and ask>0
+    mid = (df["bid"].fillna(0) + df["ask"].fillna(0)) / 2.0
+    if _use_mark:
+        eff = eff.where(eff > 0, mid)
+    # fallback to last when still 0
+    eff = eff.where(eff > 0, df["last"])  # last may be 0 if unavailable
+    df["eff_bid"] = pd.to_numeric(eff, errors="coerce").fillna(0.0)
+
+    # Avoid divide-by-zero
     denom = df["strike"].replace(0, pd.NA)
-    df["bid_strike_pct"] = (df["bid"].astype(float) / denom).astype(float) * 100.0
+    df["bid_strike_pct"] = (df["eff_bid"].astype(float) / denom).astype(float) * 100.0
     df["bid_strike_pct"] = df["bid_strike_pct"].fillna(0.0)
 
     # Parse expiration to datetime once; tolerate bad values
     exp = pd.to_datetime(df.get("expiration"), errors="coerce")
-    df["expiration"] = exp.dt.date.astype("string")
-
-    # Compute DTE defensively (NaT -> NaN)
+    # Compute DTE defensively
     today_norm = pd.Timestamp.today().normalize()
     dte_series = (exp.dt.normalize() - today_norm).dt.days
     df["dte"] = pd.to_numeric(dte_series, errors="coerce")
+    # Format expiration for display
+    df["expiration"] = exp.dt.date.astype("string")
     return df
 
 def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
@@ -355,7 +376,7 @@ def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
     mask = (
         (df["bid_strike_pct"] >= float(target_pct)) &
         (df["dte"].between(int(min_dte), int(max_dte))) &
-        (df["bid"] >= float(min_bid))
+        (df["eff_bid"] >= float(min_bid))
     )
     if "open_interest" in df.columns:
         mask &= (pd.to_numeric(df["open_interest"], errors="coerce").fillna(0) >= int(min_oi))
@@ -368,7 +389,7 @@ def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
             mask &= (pd.to_numeric(df["strike"], errors="coerce") < up)
         elif moneyness == "ITM only":
             mask &= (pd.to_numeric(df["strike"], errors="coerce") >= up)
-    out = df[mask].sort_values(["bid_strike_pct", "bid"], ascending=[False, False])
+    out = df[mask].sort_values(["bid_strike_pct", "eff_bid"], ascending=[False, False])
     return out
 
 
@@ -961,12 +982,21 @@ with scan_tab:
                 pre = compute_metrics(live_df)
                 total = len(pre)
                 dte_mask = pre["dte"].between(int(min_dte), int(max_dte))
-                bid_mask = pre["bid"] >= float(min_bid)
+                bid_mask = pre["eff_bid"] >= float(min_bid)
                 pre_in_dte = int(dte_mask.sum())
                 pre_bid_ok = int((dte_mask & bid_mask).sum())
                 st.caption(
                     f"Diagnostics — rows: {total} | in DTE range: {pre_in_dte} | in DTE and bid≥min: {pre_bid_ok}. "
                     f"(Target Bid/Strike % filter applied later: ≥{float(target_pct):.2f}%)"
+                )
+                # --- Debug table: verify bid/ask/eff_bid/strike feeding correctly ---
+                debug_cols = [c for c in [
+                    "option_symbol","provider","underlying","expiration","strike","bid","ask","eff_bid",
+                    "bid_strike_pct","dte","open_interest","volume"
+                ] if c in pre.columns]
+                st.dataframe(
+                    pre.sort_values(["bid_strike_pct","eff_bid","bid"], ascending=[False, False, False])[debug_cols].head(25),
+                    use_container_width=True,
                 )
                 try:
                     show_sample = bool(dbg_sample)
@@ -987,11 +1017,25 @@ with scan_tab:
 
     if results is not None:
         if results.empty:
+            # Show quick stats to verify ingestion when nothing matches
+            with st.expander("Show debug stats (pre-filter)"):
+                try:
+                    st.write({
+                        "rows": int(len(pre)),
+                        "eff_bid>0": int((pre.get("eff_bid", 0) > 0).sum()),
+                        "bid>0": int((pre.get("bid", 0) > 0).sum()),
+                        "ask>0": int((pre.get("ask", 0) > 0).sum()),
+                        "median_eff_bid": float(pd.to_numeric(pre.get("eff_bid", 0), errors="coerce").median()),
+                        "median_strike": float(pd.to_numeric(pre.get("strike", 0), errors="coerce").median()),
+                        "max_bid_strike_pct": float(pd.to_numeric(pre.get("bid_strike_pct", 0), errors="coerce").max()),
+                    })
+                except Exception:
+                    st.write("(no debug stats)")
             st.warning("No matches with current filters. Try lowering Target %, widening DTE, or increasing Min Bid/LIQ filters.")
         else:
             st.success(f"Found {len(results)} matching puts.")
             show_cols = [
-                "provider","option_symbol","underlying","type","strike","expiration","bid","ask",
+                "provider","option_symbol","underlying","type","strike","expiration","bid","eff_bid","ask",
                 "bid_strike_pct","dte","volume","open_interest","underlying_price","updated"
             ]
             show_cols = [c for c in show_cols if c in results.columns]
