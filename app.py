@@ -204,13 +204,22 @@ class PolygonProvider(Provider):
         return 0.0
 
     def _is_after_hours_et(self) -> bool:
-        """Return True if now is outside ~9:30–16:05 ET trading session."""
+        """True if outside 09:30–16:00 ET regular session (inclusive of boundaries)."""
         try:
-            now_utc = datetime.now(timezone.utc)
             et = dttz.gettz("America/New_York")
-            now_et = now_utc.astimezone(et)
+            now_et = datetime.now(timezone.utc).astimezone(et)
             t = now_et.time()
-            return (t >= _dtime(16, 5)) or (t < _dtime(9, 30))
+            return (t >= _dtime(16, 0)) or (t < _dtime(9, 30))
+        except Exception:
+            return True
+
+    def _is_closed_window(self) -> bool:
+        """True when we should use prior regular-session quotes: t >= 16:00 OR t < 09:30 ET."""
+        try:
+            et = dttz.gettz("America/New_York")
+            now_et = datetime.now(timezone.utc).astimezone(et)
+            t = now_et.time()
+            return (t >= _dtime(16, 0)) or (t < _dtime(9, 30))
         except Exception:
             return True
 
@@ -314,9 +323,16 @@ class PolygonProvider(Provider):
                 bid = float(nbbo.get("bid_price", 0) or 0)
                 ask = float(nbbo.get("ask_price", 0) or 0)
 
-                # Fallbacks (snapshot → last trade → previous close)
+                # If the market is closed (>=16:00 or <09:30 ET), prefer last regular-session snapshot quote
                 last_px = 0.0
-                if bid <= 0 and ask <= 0:
+                if self._is_closed_window():
+                    s_bid, s_ask, s_last = self._snapshot_quote(opt)
+                    if s_bid > 0 or s_ask > 0:
+                        bid, ask = s_bid, s_ask
+                        last_px = s_last or 0.0
+
+                # Fallbacks (snapshot → last trade → previous close) if still blank
+                if (bid is None or bid <= 0) and (ask is None or ask <= 0):
                     s_bid, s_ask, s_last = self._snapshot_quote(opt)
                     if s_bid > 0 or s_ask > 0:
                         bid, ask = s_bid, s_ask
