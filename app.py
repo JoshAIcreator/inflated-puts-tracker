@@ -437,6 +437,11 @@ with st.sidebar:
     min_bid = st.number_input("Min Bid ($)", min_value=0.0, step=0.05, value=0.10)
     min_oi = st.number_input("Min Open Interest", min_value=0, step=10, value=50)
     min_vol = st.number_input("Min Volume (today)", min_value=0, step=10, value=0)
+    be_pct = st.number_input(
+        "Min break-even % below spot",
+        min_value=0.0, step=0.5, value=10.0,
+        help="Keep only puts whose break-even (strike - premium) is at least this % below the current underlying price."
+    )
     moneyness = st.selectbox("Moneyness (requires underlying price in feed)", ["Any", "OTM only", "ITM only"], index=1)
 
     use_mark_fallback = st.checkbox("Use mid price when bid = 0 (fallback)", value=True)
@@ -484,6 +489,16 @@ def compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
     df["bid_strike_pct"] = (df["eff_bid"].astype(float) / denom).astype(float) * 100.0
     df["bid_strike_pct"] = df["bid_strike_pct"].fillna(0.0)
 
+    # Break-even for short put idea: strike - premium (use effective bid)
+    df["breakeven"] = (df["strike"] - df["eff_bid"]).astype(float)
+    # Percent buffer vs spot (only if underlying_price present and >0)
+    if "underlying_price" in df.columns:
+        up = pd.to_numeric(df["underlying_price"], errors="coerce")
+        with pd.option_context('mode.use_inf_as_na', True):
+            df["be_gap_pct"] = ((up - df["breakeven"]) / up * 100.0).where(up > 0)
+    else:
+        df["be_gap_pct"] = pd.NA
+
     # Parse expiration to datetime once; tolerate bad values
     exp = pd.to_datetime(df.get("expiration"), errors="coerce")
     # Compute DTE defensively
@@ -512,6 +527,12 @@ def filter_rows(df: pd.DataFrame) -> pd.DataFrame:
             mask &= (pd.to_numeric(df["strike"], errors="coerce") < up)
         elif moneyness == "ITM only":
             mask &= (pd.to_numeric(df["strike"], errors="coerce") >= up)
+    # Break-even threshold filter: keep only rows where breakeven <= spot * (1 - be_pct/100)
+    if "underlying_price" in df.columns and df["underlying_price"].notna().any():
+        up = pd.to_numeric(df["underlying_price"], errors="coerce")
+        be = pd.to_numeric(df["breakeven"], errors="coerce")
+        thresh = up * (1.0 - float(be_pct) / 100.0)
+        mask &= (be <= thresh)
     out = df[mask].sort_values(["bid_strike_pct", "eff_bid"], ascending=[False, False])
     return out
 
@@ -1115,7 +1136,7 @@ with scan_tab:
                 # --- Debug table: verify bid/ask/eff_bid/strike feeding correctly ---
                 debug_cols = [c for c in [
                     "option_symbol","provider","underlying","expiration","strike","bid","ask","eff_bid",
-                    "bid_strike_pct","dte","open_interest","volume"
+                    "bid_strike_pct","dte","open_interest","volume","underlying_price","breakeven","be_gap_pct"
                 ] if c in pre.columns]
                 st.dataframe(
                     pre.sort_values(["bid_strike_pct","eff_bid","bid"], ascending=[False, False, False])[debug_cols].head(25),
@@ -1159,7 +1180,7 @@ with scan_tab:
             st.success(f"Found {len(results)} matching puts.")
             show_cols = [
                 "provider","option_symbol","underlying","type","strike","expiration","bid","eff_bid","ask",
-                "bid_strike_pct","dte","volume","open_interest","underlying_price","updated"
+                "breakeven","bid_strike_pct","be_gap_pct","dte","volume","open_interest","underlying_price","updated"
             ]
             show_cols = [c for c in show_cols if c in results.columns]
             st.dataframe(results[show_cols].head(int(max_rows)), use_container_width=True)
